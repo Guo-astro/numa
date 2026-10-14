@@ -322,4 +322,36 @@ mod tests {
         let rdata = build_rdata(1, &[], &[(4, vec![1, 2, 3, 4, 5])]);
         assert!(strip_private_hints(&rdata, is_priv).is_none());
     }
+
+    #[test]
+    fn opaque_params_survive_hint_edits_byte_identical() {
+        let head = (0, vec![0xde, 0xad]);
+        // ech (key 5) whose value mimics an ipv6hint TLV header: passes only
+        // if params are walked by framing rather than scanned for.
+        let ech = (5, vec![0x00, 0x06, 0x00, 0x10, 0xfe, 0x0d]);
+        let tail = (65280, vec![0x01]);
+        let rdata = |params: &[(u16, Vec<u8>)]| build_rdata(1, &[], params);
+
+        let full = rdata(&[
+            head.clone(),
+            ipv4hint(&[PUB4, PRIV4]),
+            ech.clone(),
+            ipv6hint_single(),
+            tail.clone(),
+        ]);
+
+        assert_eq!(
+            strip_ipv6hint(&full).unwrap(),
+            rdata(&[
+                head.clone(),
+                ipv4hint(&[PUB4, PRIV4]),
+                ech.clone(),
+                tail.clone()
+            ])
+        );
+        assert_eq!(
+            strip_private_hints(&full, is_priv).unwrap(),
+            rdata(&[head, ipv4hint(&[PUB4]), ech, ipv6hint_single(), tail])
+        );
+    }
 }
