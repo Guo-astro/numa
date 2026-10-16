@@ -872,6 +872,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn named_config_path_must_be_an_existing_file() {
+        let missing = format!("numa-missing-{}.toml", std::process::id());
+        let error = named_config_path(&missing).unwrap_err().to_string();
+        let reported = error.strip_prefix("config file not found: ").unwrap();
+        assert!(Path::new(reported).is_absolute(), "{error}");
+        assert!(reported.ends_with(&missing), "{error}");
+        assert!(named_config_path(&std::env::temp_dir().to_string_lossy()).is_err());
+    }
+
+    #[test]
+    fn load_config_file_reads_the_named_file() {
+        let path = std::env::temp_dir().join(format!("numa-named-{}.toml", std::process::id()));
+        std::fs::write(&path, "[server]\napi_port = 5382\n").unwrap();
+        let load = load_config_file(&path.to_string_lossy()).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(load.found);
+        assert_eq!(load.config.server.api_port, 5382);
+    }
+
+    #[test]
     fn resolution_ceiling_defaults_and_parses() {
         let default: Config = toml::from_str("").unwrap();
         assert_eq!(
@@ -1711,6 +1731,34 @@ fn resolve_path(path: &str) -> String {
         .to_string()
 }
 
+/// A config file the user named must exist: falling back to another file,
+/// to defaults, or creating it would silently ignore a mistyped path.
+pub fn named_config_path(path: &str) -> Result<String> {
+    let resolved = resolve_path(path);
+    if Path::new(&resolved).is_file() {
+        Ok(resolved)
+    } else {
+        Err(format!("config file not found: {resolved}").into())
+    }
+}
+
+pub fn load_config_file(path: &str) -> Result<ConfigLoad> {
+    let named = named_config_path(path)?;
+    read_config(Path::new(&named))?.ok_or_else(|| format!("config file not found: {named}").into())
+}
+
+fn read_config(path: &Path) -> Result<Option<ConfigLoad>> {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => Ok(Some(ConfigLoad {
+            config: toml::from_str(&contents)?,
+            path: resolve_path(&path.to_string_lossy()),
+            found: true,
+        })),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
 pub fn load_config(path: &str) -> Result<ConfigLoad> {
     // Try the given path first, then well-known locations (for service mode where cwd is /)
     let candidates: Vec<std::path::PathBuf> = {
@@ -1732,18 +1780,8 @@ pub fn load_config(path: &str) -> Result<ConfigLoad> {
     };
 
     for candidate in &candidates {
-        match std::fs::read_to_string(candidate) {
-            Ok(contents) => {
-                let resolved = resolve_path(&candidate.to_string_lossy());
-                let config: Config = toml::from_str(&contents)?;
-                return Ok(ConfigLoad {
-                    config,
-                    path: resolved,
-                    found: true,
-                });
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e.into()),
+        if let Some(load) = read_config(candidate)? {
+            return Ok(load);
         }
     }
 

@@ -39,8 +39,8 @@ fn default_true() -> bool {
     true
 }
 
-pub fn print_config_path() -> Result<(), String> {
-    let resolved = effective_config_path()?;
+pub fn print_config_path(explicit: Option<&str>) -> Result<(), String> {
+    let resolved = effective_config_path(explicit)?;
     println!("{}", resolved.path);
     if let Some(note) = &resolved.note {
         eprintln!("note: {note}");
@@ -48,8 +48,8 @@ pub fn print_config_path() -> Result<(), String> {
     Ok(())
 }
 
-pub fn edit_config() -> Result<(), String> {
-    let resolved = effective_config_path()?;
+pub fn edit_config(explicit: Option<&str>) -> Result<(), String> {
+    let resolved = effective_config_path(explicit)?;
     let path = Path::new(&resolved.path);
     ensure_writable(path)?;
 
@@ -74,10 +74,10 @@ pub fn edit_config() -> Result<(), String> {
     Ok(())
 }
 
-pub fn print_token() -> Result<(), String> {
+pub fn print_token(explicit: Option<&str>) -> Result<(), String> {
     use crate::api_auth::{locate_token, TokenSource, TOKEN_FILE};
 
-    let resolved = effective_config_path()?;
+    let resolved = effective_config_path(explicit)?;
     let config_path = resolved.path;
     let server = crate::config::load_config(&config_path)
         .map_err(|error| unreadable(&config_path, &error))?
@@ -128,22 +128,32 @@ fn unreadable(path: &str, error: &crate::Error) -> String {
 }
 
 pub(crate) fn service_config_path() -> Result<String, String> {
-    effective_config_path().map(|resolved| resolved.display())
+    effective_config_path(None).map(|resolved| resolved.display())
 }
 
 /// The config file a CLI write should land in: what the running daemon
 /// loaded, else the first candidate that exists, else where one would be
 /// created. The bare path, not the `display()` string carrying the note.
 pub fn config_write_target() -> Result<String, String> {
-    let resolved =
-        effective_config_path().map_err(|error| format!("cannot resolve config path: {error}"))?;
+    let resolved = effective_config_path(None)
+        .map_err(|error| format!("cannot resolve config path: {error}"))?;
     ensure_writable(Path::new(&resolved.path))?;
     Ok(resolved.path)
 }
 
-fn effective_config_path() -> Result<EffectiveConfigPath, String> {
-    let local = crate::config::load_config(&crate::cli_config_path());
-    resolve_effective_config_path(local, query_daemon_config_path)
+fn effective_config_path(explicit: Option<&str>) -> Result<EffectiveConfigPath, String> {
+    match explicit {
+        Some(path) => Ok(EffectiveConfigPath {
+            path: crate::config::named_config_path(path).map_err(|e| e.to_string())?,
+            from_daemon: false,
+            note: None,
+            data_dir: None,
+        }),
+        None => {
+            let local = crate::config::load_config(&crate::cli_config_path());
+            resolve_effective_config_path(local, query_daemon_config_path)
+        }
+    }
 }
 
 fn resolve_effective_config_path<F>(
