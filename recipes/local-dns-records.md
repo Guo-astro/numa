@@ -22,6 +22,8 @@ ttl         = 300
 
 Any domain works, not just a local suffix. Zones are checked before the cache and before any upstream or recursive lookup, so a match never leaves the box.
 
+Numa answers every record type for a name that you list. A type that you did not list gets an empty answer, not the upstream answer. This stops IPv6 clients from bypassing an A record on a public name.
+
 ## Reverse lookups
 
 Reverse the address and append `in-addr.arpa`, so `192.168.1.1` becomes `1.1.168.192.in-addr.arpa`:
@@ -49,6 +51,23 @@ value       = "v=spf1 mx -all"
 ```
 
 A TXT value is plain text, without zone-file quotes. Numa splits values longer than 255 bytes, such as DKIM keys, into 255-byte strings.
+
+## Many records
+
+For a long list, put the records in an inline array, one record per line:
+
+```toml
+zones = [
+  { domain = "nas.home.lan", record_type = "A",   value = "192.168.1.10" },
+  { domain = "home.lan",     record_type = "MX",  value = "10 mail.home.lan" },
+  { domain = "home.lan",     record_type = "TXT", value = "v=spf1 mx -all" },
+]
+
+[server]
+# ...
+```
+
+Put the array before the first `[section]` header. If the array comes after a header, TOML puts it in that section. Numa then ignores the records. Use the array or `[[zones]]` tables, not both. TOML rejects a file that has both with a duplicate key error.
 
 ## Cover a subtree with a wildcard
 

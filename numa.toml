@@ -199,6 +199,7 @@ tld = "numa"
 # target_port = 8000
 # target_host = "192.168.1.50"  # optional, defaults to localhost
 
+# Many records: use an inline array, see recipes/local-dns-records.md.
 # Example zone records:
 # [[zones]]
 # domain = "dimescu.ro"
