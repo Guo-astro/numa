@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use crate::buffer::canonical_name;
 use crate::question::QueryType;
 use crate::record::DnsRecord;
 use crate::Result;
@@ -1137,6 +1138,8 @@ mod tests {
         assert!(build_zone_map(&[zone("*.*.foo", "A", "10.0.0.1")]).is_err());
         assert!(build_zone_map(&[zone("foo.*.bar", "A", "10.0.0.1")]).is_err());
         assert!(build_zone_map(&[zone("*foo.bar", "A", "10.0.0.1")]).is_err());
+        assert!(build_zone_map(&[zone(".", "A", "10.0.0.1")]).is_err());
+        assert!(build_zone_map(&[zone("", "A", "10.0.0.1")]).is_err());
     }
 
     #[test]
@@ -1152,6 +1155,32 @@ mod tests {
                 );
             }
             other => panic!("expected CNAME, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn unwritable_cname_target_rejected() {
+        let long_label = format!("{}.lan", "a".repeat(64));
+        assert!(build_zone_map(&[zone("app.test", "CNAME", &long_label)]).is_err());
+        assert!(build_zone_map(&[zone("app.test", "CNAME", "x.ab\\")]).is_err());
+    }
+
+    #[test]
+    fn owner_and_cname_target_typed_alike_match() {
+        for name in ["näs.lan", "\\065.lan", "NAS.lan."] {
+            let map = build_zone_map(&[
+                zone("app.lan", "CNAME", name),
+                zone(name, "A", "192.168.1.42"),
+            ])
+            .unwrap();
+            let cname = map.lookup("app.lan", QueryType::CNAME).expect("hit");
+            let DnsRecord::CNAME { host, .. } = &cname[0] else {
+                panic!("expected CNAME, got {:?}", cname[0]);
+            };
+            assert!(
+                map.lookup(host, QueryType::A).is_some(),
+                "{name:?} -> {host:?}"
+            );
         }
     }
 
@@ -2001,14 +2030,13 @@ pub fn build_zone_map(zones: &[ZoneRecord]) -> Result<ZoneMap> {
     let mut map = ZoneMap::default();
 
     for zone in zones {
-        let raw = zone.domain.trim().to_lowercase();
-        let raw = raw.trim_end_matches('.');
+        let raw = canonical_zone_name("zone domain", zone.domain.trim())?;
         let is_wildcard = raw.starts_with("*.");
-        let key = if is_wildcard { &raw[2..] } else { raw };
-        if key.is_empty() || key.contains('*') {
+        let key = if is_wildcard { &raw[2..] } else { &raw };
+        if key == "." || key.contains('*') {
             return Err(format!("invalid wildcard zone '{}'", raw).into());
         }
-        let domain = zone_name("zone domain", key)?;
+        let domain = key.to_string();
         let value = zone.value.trim();
         let (qtype, record) = match zone.record_type.to_uppercase().as_str() {
             "A" => {
@@ -2041,7 +2069,7 @@ pub fn build_zone_map(zones: &[ZoneRecord]) -> Result<ZoneMap> {
                 QueryType::CNAME,
                 DnsRecord::CNAME {
                     domain: domain.clone(),
-                    host: zone_name("CNAME target", value)?,
+                    host: canonical_zone_name("CNAME target", value)?,
                     ttl: zone.ttl,
                 },
             ),
@@ -2102,7 +2130,7 @@ pub fn build_zone_map(zones: &[ZoneRecord]) -> Result<ZoneMap> {
         let rrset = bucket.entry(domain).or_default().entry(qtype).or_default();
         rrset.push(record);
         if qtype == QueryType::TXT {
-            check_txt_fits(raw, rrset)?;
+            check_txt_fits(&raw, rrset)?;
         }
     }
 
@@ -2114,6 +2142,11 @@ fn zone_name(what: &str, name: &str) -> Result<String> {
         return Err(format!("{what} '{name}' contains whitespace").into());
     }
     Ok(name.to_string())
+}
+
+fn canonical_zone_name(what: &str, name: &str) -> Result<String> {
+    let name = zone_name(what, name)?;
+    canonical_name(&name).map_err(|e| format!("invalid {what} '{name}': {e}").into())
 }
 
 /// Room left in a response after the header, the longest possible question
