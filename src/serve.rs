@@ -12,7 +12,7 @@ use std::time::Duration;
 use log::{debug, error, info, warn};
 
 use crate::blocklist::{
-    download_blocklists, parse_blocklist, parse_blocklist_counted, source_defect, BlocklistStore,
+    download_blocklists, parse_blocklist_counted, source_defect, BlocklistStore, SourceKind,
     SourceResult,
 };
 use crate::blocklist_cache::BlocklistCache;
@@ -69,11 +69,9 @@ pub async fn run(load: ConfigLoad) -> crate::Result<()> {
     let dnssec_enabled = effective_dnssec(&config, resolved_mode);
     let api_port = config.server.api_port;
 
+    let (allow_sources, allow_domains) = config.blocking.split_allowlist();
     let mut blocklist = BlocklistStore::new(
-        crate::domain_list::PersistedDomainList::new(
-            "blocking-allow.json",
-            &config.blocking.allowlist,
-        ),
+        crate::domain_list::PersistedDomainList::new("blocking-allow.json", &allow_domains),
         crate::domain_list::PersistedDomainList::new("blocking-block.json", &[]),
     );
     // Seeded before the first fetch so the dashboard can tell a source that has
@@ -81,6 +79,7 @@ pub async fn run(load: ConfigLoad) -> crate::Result<()> {
     // blocking is off, or a disabled box reports its configured lists as though
     // it had none; `health` reports the switch separately.
     blocklist.set_sources(&config.blocking.lists);
+    blocklist.set_allow_sources(&allow_sources);
     if !config.blocking.enabled {
         blocklist.set_enabled(false);
     }
@@ -302,16 +301,21 @@ fn spawn_background_services(
     bootstrap_resolver: &Arc<NumaResolver>,
     api_port: u16,
 ) -> crate::Result<()> {
-    let blocklist_lists = crate::blocklist::dedup_sources(&config.blocking.lists);
+    let blocklist_lists = config.blocking.lists.clone();
+    let (allow_lists, _) = config.blocking.split_allowlist();
     let refresh_hours = config.blocking.refresh_hours;
     if config.blocking.enabled && !blocklist_lists.is_empty() {
         let bl_ctx = Arc::clone(ctx);
         let bl_resolver = bootstrap_resolver.clone();
         tokio::spawn(async move {
             loop {
-                let loaded =
-                    load_blocklists_purging(&bl_ctx, &blocklist_lists, Some(bl_resolver.clone()))
-                        .await;
+                let loaded = load_blocklists_purging(
+                    &bl_ctx,
+                    &blocklist_lists,
+                    &allow_lists,
+                    Some(bl_resolver.clone()),
+                )
+                .await;
                 // A refresh that left us with nothing is not blocking at all, so
                 // waiting the full cycle to try again turns a brief upstream
                 // outage into a day without blocking (issue #336). The config
@@ -861,18 +865,15 @@ fn live_domains(
     source: &str,
     fetched: &Result<String, String>,
     cache: &BlocklistCache,
+    kind: SourceKind,
 ) -> Result<HashSet<String>, String> {
     let text = fetched.as_ref().map_err(Clone::clone)?;
-    let parsed = parse_blocklist_counted(text);
+    let parsed = parse_blocklist_counted(text, kind);
     if let Some(why) = source_defect(source, &parsed) {
-        error!("blocklist source failed: {source} — {why}");
+        error!("list source failed: {source} — {why}");
         return Err("not a domain list".to_string());
     }
-    info!(
-        "blocklist: {} domains from {}",
-        parsed.domains.len(),
-        source
-    );
+    info!("list: {} domains from {source}", parsed.domains.len());
     cache.store(source, text);
     Ok(parsed.domains)
 }
@@ -887,7 +888,8 @@ const MI_OPTION_PURGE_DELAY: libmimalloc_sys::mi_option_t = 15;
 // throughput pays for eager purging, and queries are not what a reload is doing.
 async fn load_blocklists_purging(
     ctx: &ServerCtx,
-    lists: &[String],
+    block: &[String],
+    allow: &[String],
     resolver: Option<Arc<NumaResolver>>,
 ) -> bool {
     #[cfg(target_env = "musl")]
@@ -896,7 +898,7 @@ async fn load_blocklists_purging(
         libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, 0);
         delay
     };
-    let loaded = load_blocklists(ctx, lists, resolver).await;
+    let loaded = load_blocklists(ctx, block, allow, resolver).await;
     #[cfg(target_env = "musl")]
     unsafe {
         libmimalloc_sys::mi_collect(true);
@@ -905,88 +907,135 @@ async fn load_blocklists_purging(
     loaded
 }
 
-/// Returns `false` only when a failure left nothing loaded at all. An emptied
-/// list is a successful load of nothing, and has nothing to retry.
 async fn load_blocklists(
     ctx: &ServerCtx,
-    lists: &[String],
+    block: &[String],
+    allow: &[String],
     resolver: Option<Arc<NumaResolver>>,
 ) -> bool {
-    let downloaded = download_blocklists(lists, resolver).await;
+    let sources = crate::blocklist::dedup_sources(&[block, allow].concat());
+    let downloaded = download_blocklists(&sources, resolver).await;
+    apply_downloads(ctx, block, allow, &downloaded)
+}
 
-    // Parse outside the lock to avoid blocking DNS queries during parse (~100ms)
-    let mut all_domains = HashSet::new();
-    let mut outcomes = Vec::with_capacity(downloaded.len());
-    let mut failed = 0;
-    let mut stale = 0;
-    let cache = BlocklistCache::new(&ctx.data_dir);
-    for (source, fetched) in &downloaded {
-        let result = match live_domains(source, fetched, &cache) {
+/// What the sources of one kind parsed to on this refresh.
+struct ParsedSources {
+    domains: HashSet<String>,
+    outcomes: Vec<(String, SourceResult)>,
+    failed: usize,
+    stale: usize,
+}
+
+impl ParsedSources {
+    /// Nothing to swap in is a failure only if something broke (issue #336);
+    /// sources that all loaded and parsed to nothing are a deliberately emptied
+    /// list and must be allowed to clear the old one.
+    fn broke(&self) -> bool {
+        self.domains.is_empty() && self.failed > 0
+    }
+}
+
+fn parse_sources(
+    sources: &[String],
+    downloaded: &[(String, Result<String, String>)],
+    cache: &BlocklistCache,
+    kind: SourceKind,
+) -> ParsedSources {
+    let mut parsed = ParsedSources {
+        domains: HashSet::new(),
+        outcomes: Vec::with_capacity(sources.len()),
+        failed: 0,
+        stale: 0,
+    };
+    for (source, fetched) in downloaded.iter().filter(|(s, _)| sources.contains(s)) {
+        let result = match live_domains(source, fetched, cache, kind) {
             Ok(domains) => {
-                merge_into(&mut all_domains, domains);
+                merge_into(&mut parsed.domains, domains);
                 SourceResult::Loaded
             }
             // A stale list still blocks; nothing at all does not. The cached copy
             // is never refused for being old (issue #336).
             Err(error) => match cache.load(source) {
                 Some(cached) => {
-                    stale += 1;
-                    merge_into(&mut all_domains, parse_blocklist(&cached.text));
+                    parsed.stale += 1;
+                    let domains = parse_blocklist_counted(&cached.text, kind).domains;
+                    merge_into(&mut parsed.domains, domains);
                     SourceResult::Cached {
                         error,
                         fetched_unix: cached.fetched_unix,
                     }
                 }
                 None => {
-                    failed += 1;
+                    parsed.failed += 1;
                     SourceResult::Failed(error)
                 }
             },
         };
-        outcomes.push((source.clone(), result));
+        parsed.outcomes.push((source.clone(), result));
     }
-    cache.prune(lists);
-    let total = all_domains.len();
+    parsed
+}
+
+/// Returns `false` only when a failure left blocking with nothing loaded at all.
+/// An emptied list is a successful load of nothing, and has nothing to retry.
+fn apply_downloads(
+    ctx: &ServerCtx,
+    block: &[String],
+    allow: &[String],
+    downloaded: &[(String, Result<String, String>)],
+) -> bool {
+    // Parse outside the lock to avoid blocking DNS queries during parse (~100ms)
+    let cache = BlocklistCache::new(&ctx.data_dir);
+    let mut blocks = parse_sources(block, downloaded, &cache, SourceKind::Block);
+    let mut allows = parse_sources(allow, downloaded, &cache, SourceKind::Allow);
+    cache.prune(&[block, allow].concat());
 
     // Lock work stays sub-microsecond: record, then swap or keep.
     let mut store = ctx.blocklist.write().unwrap();
-    store.record_outcomes(&outcomes);
-
-    // Nothing to swap in is a failure only if something broke (issue #336);
-    // sources that all loaded and parsed to nothing are a deliberately emptied
-    // list and must be allowed to clear the old one.
-    if total == 0 && failed > 0 {
-        let kept = store.domains_loaded();
-        drop(store);
-        error!(
-            "blocklist refresh failed for {failed} of {} lists — keeping {kept} domains already loaded",
-            lists.len()
-        );
-        return kept > 0;
+    store.record_outcomes(&blocks.outcomes);
+    store.record_outcomes(&allows.outcomes);
+    let (blocks_broke, allows_broke) = (blocks.broke(), allows.broke());
+    if !blocks_broke {
+        store.swap_domains(std::mem::take(&mut blocks.domains));
     }
+    if !allows_broke {
+        store.swap_allow_domains(std::mem::take(&mut allows.domains));
+    }
+    let (block_total, allow_total) = (store.domains_loaded(), store.allow_domains_loaded());
+    drop(store);
 
+    log_refresh("blocking", &blocks, blocks_broke, block_total);
+    if !allow.is_empty() {
+        log_refresh("allowlist", &allows, allows_broke, allow_total);
+    }
+    // A retry re-downloads every block list, so only blocking earns one.
+    !blocks_broke || block_total > 0
+}
+
+/// `total` is what is live after the refresh, whether kept or swapped in.
+fn log_refresh(label: &str, parsed: &ParsedSources, broke: bool, total: usize) {
+    let (lists, failed, stale) = (parsed.outcomes.len(), parsed.failed, parsed.stale);
+    if broke {
+        error!(
+            "{label} refresh failed for {failed} of {lists} lists — keeping {total} domains already loaded"
+        );
+        return;
+    }
     // Live only. A cached source is contributing domains but is not evidence
     // its upstream works, and counting it as loaded is the overstatement this
     // reporting exists to remove.
-    let loaded = outcomes.len() - failed - stale;
-    store.swap_domains(all_domains);
-    drop(store);
+    let loaded = lists - failed - stale;
     if failed > 0 {
         // Spells out stale too — the degraded branch wins the `if`, so a box
         // that is both would otherwise never mention its cached lists.
         warn!(
-            "blocking degraded: {total} unique domains, {loaded} of {} lists live, {stale} from cache, {failed} failed",
-            lists.len()
+            "{label} degraded: {total} unique domains, {loaded} of {lists} lists live, {stale} from cache, {failed} failed"
         );
     } else if stale > 0 {
-        warn!(
-            "blocking stale: {total} unique domains, {stale} of {} lists served from cache",
-            lists.len()
-        );
+        warn!("{label} stale: {total} unique domains, {stale} of {lists} lists served from cache");
     } else {
-        info!("blocking enabled: {total} unique domains from {loaded} lists");
+        info!("{label} enabled: {total} unique domains from {loaded} lists");
     }
-    true
 }
 
 async fn warm_domain(ctx: &ServerCtx, domain: &str) {
@@ -1152,7 +1201,7 @@ mod tests {
     async fn failed_source_keeps_the_live_list() {
         let ctx = ctx_blocking(&["ads.example.com"]).await;
         let missing = temp_path("never_written");
-        let loaded = load_blocklists(&ctx, std::slice::from_ref(&missing), None).await;
+        let loaded = load_blocklists(&ctx, std::slice::from_ref(&missing), &[], None).await;
         assert_eq!(ctx.blocklist.read().unwrap().domains_loaded(), 1);
         assert!(
             loaded,
@@ -1166,7 +1215,7 @@ mod tests {
     async fn total_failure_with_no_live_list_asks_for_a_retry() {
         let ctx = ctx_blocking(&[]).await;
         let missing = temp_path("never_written_either");
-        let loaded = load_blocklists(&ctx, std::slice::from_ref(&missing), None).await;
+        let loaded = load_blocklists(&ctx, std::slice::from_ref(&missing), &[], None).await;
         assert_eq!(ctx.blocklist.read().unwrap().domains_loaded(), 0);
         assert!(!loaded);
     }
@@ -1177,7 +1226,7 @@ mod tests {
     async fn emptied_local_list_clears_the_live_list() {
         let ctx = ctx_blocking(&["ads.example.com"]).await;
         let source = temp_list("emptied", "# all clear\n");
-        let loaded = load_blocklists(&ctx, std::slice::from_ref(&source), None).await;
+        let loaded = load_blocklists(&ctx, std::slice::from_ref(&source), &[], None).await;
         let _ = std::fs::remove_file(&source);
         assert_eq!(ctx.blocklist.read().unwrap().domains_loaded(), 0);
         assert!(
@@ -1190,8 +1239,87 @@ mod tests {
     async fn healthy_local_list_is_swapped_in() {
         let ctx = ctx_blocking(&["ads.example.com"]).await;
         let source = temp_list("healthy", "a.com\nb.com\n");
-        load_blocklists(&ctx, std::slice::from_ref(&source), None).await;
+        load_blocklists(&ctx, std::slice::from_ref(&source), &[], None).await;
         let _ = std::fs::remove_file(&source);
         assert_eq!(ctx.blocklist.read().unwrap().domains_loaded(), 2);
+    }
+
+    fn fetched(source: &str, body: &str) -> (String, Result<String, String>) {
+        (source.to_string(), Ok(body.to_string()))
+    }
+
+    fn unfetched(source: &str) -> (String, Result<String, String>) {
+        (source.to_string(), Err("unreadable".to_string()))
+    }
+
+    #[tokio::test]
+    async fn allow_source_unblocks_after_load() {
+        let ctx = ctx_blocking(&[]).await;
+        let (block, allow) = (temp_path("block_src"), temp_path("allow_src"));
+        let loaded = apply_downloads(
+            &ctx,
+            std::slice::from_ref(&block),
+            std::slice::from_ref(&allow),
+            &[
+                fetched(&block, "example.com\n"),
+                fetched(&allow, "go.example.com\n@@||other.example.com^\n"),
+            ],
+        );
+        assert!(loaded);
+        let store = ctx.blocklist.read().unwrap();
+        assert!(store.is_blocked("ads.example.com"));
+        assert!(!store.is_blocked("go.example.com"));
+        assert!(!store.is_blocked("other.example.com"), "adblock @@ line");
+    }
+
+    #[tokio::test]
+    async fn failed_allow_refresh_keeps_previous_allow_set() {
+        let ctx = ctx_blocking(&["example.com"]).await;
+        ctx.blocklist
+            .write()
+            .unwrap()
+            .swap_allow_domains(["go.example.com".to_string()].into());
+        let (block, allow) = (temp_path("block_ok"), temp_path("allow_gone"));
+        apply_downloads(
+            &ctx,
+            std::slice::from_ref(&block),
+            std::slice::from_ref(&allow),
+            &[fetched(&block, "example.com\n"), unfetched(&allow)],
+        );
+        assert!(!ctx.blocklist.read().unwrap().is_blocked("go.example.com"));
+    }
+
+    /// Pruning by block sources alone would delete this copy on every refresh.
+    #[tokio::test]
+    async fn refresh_keeps_cached_copies_of_allow_sources() {
+        let mut ctx = ctx_blocking(&[]).await;
+        ctx.data_dir = std::path::PathBuf::from(temp_path("allow_cache_dir"));
+        let allow = "https://allow.example/list.txt".to_string();
+        BlocklistCache::new(&ctx.data_dir).store(&allow, "go.example.com\n");
+        let block = temp_path("block_beside_cache");
+        apply_downloads(
+            &ctx,
+            std::slice::from_ref(&block),
+            std::slice::from_ref(&allow),
+            &[fetched(&block, "example.com\n"), unfetched(&allow)],
+        );
+        assert!(!ctx.blocklist.read().unwrap().is_blocked("go.example.com"));
+        assert!(BlocklistCache::new(&ctx.data_dir).load(&allow).is_some());
+        let _ = std::fs::remove_dir_all(&ctx.data_dir);
+    }
+
+    /// Retrying soon re-downloads every block list, so only a dead block side
+    /// earns it. A dead allow source waits for the next refresh.
+    #[tokio::test]
+    async fn allow_failure_does_not_force_a_block_refetch() {
+        let ctx = ctx_blocking(&[]).await;
+        let (block, allow) = (temp_path("block_fine"), temp_path("allow_never"));
+        let loaded = apply_downloads(
+            &ctx,
+            std::slice::from_ref(&block),
+            std::slice::from_ref(&allow),
+            &[fetched(&block, "example.com\n"), unfetched(&allow)],
+        );
+        assert!(loaded, "blocking is healthy, so wait a full cycle");
     }
 }
