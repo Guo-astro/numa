@@ -262,11 +262,8 @@ impl ScutilState {
         let Some(val) = line.split(':').nth(1) else {
             return;
         };
-        let domain = val.trim().trim_end_matches('.').to_lowercase();
-        if !domain.is_empty()
-            && domain != "local"
-            && !domain.ends_with("in-addr.arpa")
-            && !domain.ends_with("ip6.arpa")
+        let domain = crate::blocklist::normalize(val.trim());
+        if !domain.is_empty() && !domain.ends_with("in-addr.arpa") && !domain.ends_with("ip6.arpa")
         {
             self.current_domain = Some(domain);
         }
@@ -302,6 +299,17 @@ impl ScutilState {
         }
         false
     }
+
+    fn parse(text: &str) -> Self {
+        let mut state = Self::default();
+        for line in text.lines() {
+            if state.handle_line(line.trim()) {
+                break;
+            }
+        }
+        state.flush();
+        state
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -320,19 +328,11 @@ fn discover_macos() -> SystemDnsInfo {
     };
 
     let text = String::from_utf8_lossy(&output.stdout);
-    let mut state = ScutilState::default();
-    for line in text.lines() {
-        if state.handle_line(line.trim()) {
-            break;
-        }
-    }
-    state.flush();
-
     let ScutilState {
         mut rules,
         default_upstream,
         ..
-    } = state;
+    } = ScutilState::parse(&text);
     rules.sort_by_key(|r| std::cmp::Reverse(r.suffix.len()));
 
     for rule in &rules {
@@ -359,7 +359,14 @@ fn discover_macos() -> SystemDnsInfo {
 fn make_rule(domain: &str, nameserver: &str) -> Option<ForwardingRule> {
     let addr = crate::forward::parse_upstream_addr(nameserver, 53).ok()?;
     let pool = UpstreamPool::new(vec![Upstream::Udp(addr)], vec![]);
-    Some(ForwardingRule::new(domain.to_string(), pool))
+    let rule = ForwardingRule::new(domain.to_string(), pool);
+    // A `local` rule would send mDNS names (RFC 6762) upstream instead of
+    // letting ctx answer them as special-use.
+    if rule.suffix == "local" {
+        info!("not forwarding .local to {nameserver} (mDNS); a [[forwarding]] rule with suffix = \"local\" overrides this");
+        return None;
+    }
+    Some(rule)
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -2297,6 +2304,30 @@ mod tests {
     #[test]
     fn search_domain_rules_empty_without_upstream() {
         assert!(search_domain_rules(&["example.com".to_string()], None).is_empty());
+    }
+
+    #[test]
+    fn search_domain_rules_skip_only_mdns_local() {
+        let domains = [
+            "local",
+            "LOCAL",
+            "corp.local",
+            "10.in-addr.arpa",
+            "d.f.ip6.arpa",
+        ]
+        .map(String::from);
+        let rules = search_domain_rules(&domains, Some("192.168.1.1"));
+        let suffixes: Vec<&str> = rules.iter().map(|r| r.suffix.as_str()).collect();
+        assert_eq!(suffixes, ["corp.local", "10.in-addr.arpa", "d.f.ip6.arpa"]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn scutil_rules_skip_supplemental_reverse_zones() {
+        let text = "resolver #1\n  nameserver[0] : 192.168.1.1\n\nresolver #2\n  domain   : corp.example\n  nameserver[0] : 10.8.0.1\n  flags    : Supplemental, Request A records\n\nresolver #3\n  domain   : 8.10.in-addr.arpa\n  nameserver[0] : 10.8.0.1\n  flags    : Supplemental, Request A records\n";
+        let state = ScutilState::parse(text);
+        let suffixes: Vec<&str> = state.rules.iter().map(|r| r.suffix.as_str()).collect();
+        assert_eq!(suffixes, ["corp.example"]);
     }
 
     #[test]
